@@ -17,22 +17,25 @@ async function hf(url,token,opts={},stage='connect'){
 function fileData(v){if(!v||typeof v!=='object'||typeof v.path!=='string')throw fail('HF_SCHEMA','file');return {path:v.path,meta:{_type:'gradio.FileData'}};}
 function safeFile(v){const u=new URL(v?.url||`${API}/file=${v?.path||''}`,HOST);if(u.origin!==HOST||!/^\/(?:gradio_api\/)?file=/.test(u.pathname)||!u.pathname.toLowerCase().endsWith('.glb')||u.search||u.hash)throw fail('HF_SCHEMA','extract');return u.pathname;}
 // Same random session_hash is essential: Gradio stores the generated latent state in gr.State.
+// Gradio 6.1 queues messages by session_hash. /call/.../<event_id> reads by
+// event_id instead, so it cannot be paired with a custom persistent session.
+// Submit by name, then read the full queue stream by the SAME session hash.
 async function call(name,data,session,token,signal,stage,ignore=false){
  const q=await hf(`${API}/call/${name}`,token,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({data,session_hash:session}),signal},stage);
  const {event_id:id}=await q.json();if(typeof id!=='string'||!(/^[\w-]{1,128}$/.test(id)))throw fail('HF_SCHEMA',stage);
- const r=await hf(`${API}/call/${name}/${id}`,token,{signal},stage);if(!r.body)throw fail('HF_SCHEMA',stage);
- // The preview HTML can be large; keep only bounded line buffers and discard the image_to_3d data.
- const reader=r.body.getReader(),decoder=new TextDecoder();let buf='',event='',payload='',discard=false;
- try{while(true){const {value,done}=await reader.read();if(done)break;buf+=decoder.decode(value,{stream:true});let idx;
- while((idx=buf.indexOf('\n'))>=0){let line=buf.slice(0,idx).replace(/\r$/,'');buf=buf.slice(idx+1);
- if(line.startsWith('event:')){event=line.slice(6).trim();payload='';discard=false;}
- else if(line.startsWith('data:')){if(!discard&&!(ignore&&event==='complete'))payload+=(payload?'\n':'')+line.slice(5).trimStart();}
- else if(!line){if(event==='error')throw classify(payload,stage);if(event==='complete'){if(ignore)return null;try{return JSON.parse(payload)}catch{throw fail('HF_SCHEMA',stage)}}event='';payload='';discard=false;}
- if(payload.length>2*1024*1024)throw fail('HF_SCHEMA',stage);
- }
- if(buf.length>512*1024){if(ignore&&event==='complete'&&(discard||buf.startsWith('data:'))){buf='';discard=true;}else throw fail('HF_SCHEMA',stage);}
+ const r=await hf(`${API}/queue/data?session_hash=${encodeURIComponent(session)}`,token,{signal,headers:{Accept:'text/event-stream'}},stage);if(!r.body)throw fail('HF_SCHEMA',stage);
+ const reader=r.body.getReader(),decoder=new TextDecoder();let line='',tail='',large=false,complete=false,result;
+ function append(s){if(!large){line+=s;if(line.length>1024*1024){if(!ignore||!/^data:\s*\{\s*"msg"\s*:\s*"process_completed"/.test(line)||!line.slice(0,512).includes(id))throw fail('HF_SCHEMA',stage);large=true;tail=line.slice(-4096);line=line.slice(0,512);}}else tail=(tail+s).slice(-4096);}
+ function finish(){if(large){if(!/}\s*,\s*"success"\s*:\s*true\s*,\s*"title"\s*:\s*(?:null|"[^"\\]*")\s*}\s*$/.test(tail))throw fail('HF_FAILED',stage);complete=true;result=null;}
+ else if(line.startsWith('data:')){let msg;try{msg=JSON.parse(line.slice(5))}catch{throw fail('HF_SCHEMA',stage)}
+  if(msg.msg==='unexpected_error'){console.warn('TRELLIS queue error',stage,msg.session_not_found?'session_not_found':'upstream_error');throw classify(String(msg.message||''),stage);}
+  if(msg.msg==='process_completed'&&msg.event_id===id){if(msg.success!==true){const error=String(msg.output?.error||msg.title||'');console.warn('TRELLIS job failed',stage,error?'upstream_error':'no_detail');throw classify(error,stage);}if(!ignore&&!Array.isArray(msg.output?.data))throw fail('HF_SCHEMA',stage);complete=true;result=ignore?null:msg.output.data;}
+  if(msg.msg==='close_stream'&&complete)return true;
+ }line='';tail='';large=false;return false;}
+ try{while(true){const {value,done}=await reader.read();const chunk=done?decoder.decode():decoder.decode(value,{stream:true});let start=0,idx;
+ while((idx=chunk.indexOf('\n',start))!==-1){append(chunk.slice(start,idx));if(finish())return result;start=idx+1;}append(chunk.slice(start));if(done){if(line||large)finish();if(complete)return result;break;}
  }}finally{try{await reader.cancel()}catch{}}
- throw fail('HF_FAILED',stage);
+ console.warn('TRELLIS queue ended without completion',stage);throw fail('HF_FAILED',stage);
 }
 export async function runTrellis(d,token,signal,emit){
  const session=crypto.randomUUID().replace(/-/g,'');const res=d.resolution==='1024'?'1024':'512';
