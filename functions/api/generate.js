@@ -7,14 +7,14 @@ if(engine==='cloudflare'){
  if(typeof env.AI?.run!=='function')return json({error:'Cloudflare AI binding missing. Add AI to Production and redeploy.'},503);
  try{
   const lang=['zh','en','ru'].includes(d.lang)?d.lang:'zh';
-  let plan;try{plan=await buildSmartPlan(env.AI,prompt,d.settings||{},lang,d.tool)}catch(e){console.error('Smart plan failed',String(e?.message||e));return json({error:'SMART_PLAN_FAILED'},502);}
+  const plan=await buildSmartPlan(env.AI,prompt,d.settings||{},lang,d.tool);
   for(let attempt=1;attempt<=2;attempt++){
    const fluxPrompt=attempt===1?plan.prompt:('A solid all-metal sculpture, unbroken metal surfaces, no separate inset objects, no stone settings. '+plan.prompt).slice(0,2048);
    const out=await env.AI.run('@cf/black-forest-labs/flux-1-schnell',{prompt:fluxPrompt,steps:8});
    if(typeof out?.image!=='string'||!out.image||!(/^[A-Za-z0-9+/=]+$/.test(out.image)))throw Error('Cloudflare AI returned no valid image.');
    if(plan.noStone){
-    let check;try{check=await inspectStoneFree(env.AI,out.image)}catch(e){console.error('Vision check failed',String(e?.message||e));return json({error:'STONE_CHECK_UNAVAILABLE'},502);}
-    if(check==='UNSURE')return json({error:'STONE_CHECK_UNAVAILABLE'},422);
+    let check;try{check=await inspectStoneFree(env.AI,out.image)}catch(e){console.error('Vision check failed',String(e?.message||e));check='UNSURE';}
+    if(check==='UNSURE')return json({image:'data:image/jpeg;base64,'+out.image,engine:'cloudflare',plan,check:'manual_required',attempts:attempt});
     if(check==='FAIL'){if(attempt===1)continue;return json({error:'STONE_CHECK_REJECTED'},422);}
    }
    return json({image:'data:image/jpeg;base64,'+out.image,engine:'cloudflare',plan,check:plan.noStone?'passed':'not_required',attempts:attempt});
