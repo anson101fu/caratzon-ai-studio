@@ -6,7 +6,11 @@ function hfToken(env){return typeof env.HF_TOKEN==='string'&&/^hf_[A-Za-z0-9]+$/
 function fail(code,stage){return Object.assign(new Error(code),{code,stage});}
 function classify(text,stage,status){if(/quota|zerogpu.*limit|gpu.*(?:seconds|exceeded)|rate.limit/i.test(text)||status===429)return fail('HF_QUOTA',stage);if(status===401||status===403||/unauthori[sz]ed|invalid token/i.test(text))return fail('HF_AUTH',stage);return fail('HF_FAILED',stage);}
 async function hf(url,token,opts={},stage='connect'){
- const r=await fetch(url,{...opts,redirect:'error',headers:{Authorization:'Bearer '+token,...opts.headers}});
+ // Workers supports manual/follow only. Never forward credentials to a redirect target.
+ let r;
+ try{r=await fetch(url,{...opts,redirect:'manual',headers:{Authorization:'Bearer '+token,...opts.headers}});}
+ catch(e){console.warn('TRELLIS transport',stage,e?.name||'Error');throw fail('HF_FAILED',stage);}
+ if(r.status>=300&&r.status<400){console.warn('TRELLIS unexpected redirect',stage,r.status);throw fail('HF_FAILED',stage);}
  if(!r.ok){let msg=(await r.text()).slice(0,1200);console.warn('TRELLIS upstream',stage,r.status);throw classify(msg,stage,r.status);}
  return r;
 }
