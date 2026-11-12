@@ -1,0 +1,1 @@
+(()=>{const a=document.querySelector('[data-free-link]');const update=()=>{a.textContent=({zh:'免费工具 V2',en:'Free tools V2',ru:'Бесплатные инструменты V2'})[document.getElementById('lang').value]||'免费工具 V2'};document.getElementById('lang').addEventListener('change',update);update()})();
