@@ -15,11 +15,11 @@ function syncCloud3D(){const panel=c3el('Panel');if(!panel)return;panel.hidden=a
  const ids={Title:'title',Intro:'intro',Empty:'empty',Step1:'s1',Step1Info:'i1',Copy:'copy',Download:'download',Step2:'s2',Step2Info:'i2',Step3:'s3',Step3Info:'i3',Load:cloud3dLoaded?'loaded':'load',External:'external',Login:'login',Privacy:'privacy',Import:'import',Views:'views',Limit:'limit'};
  for(const [id,k] of Object.entries(ids))c3el(id).textContent=c3t(k);
  c3el('Load').disabled=cloud3dLoaded;
- set('generateLabel',c3t('start'));set('toolnote',c3t('note'));set('toolintro',c3t('introModel'));
+ // Main generate button is controlled by the V3.6 direct flow.
  const mesh=document.querySelector('[data-i="meshNote"]');if(mesh)mesh.textContent=c3t('mesh');
  refreshCloud3DSource();
 }
-function openCloud3D(){cloud3dOpened=true;syncCloud3D();c3el('Panel').scrollIntoView({block:'start',behavior:'smooth'});}
+function openCloud3D(){cloud3dOpened=true;syncCloud3D();syncDirect3D();c3el('Panel').scrollIntoView({block:'start',behavior:'smooth'});}
 function cloud3dLoad(){if(cloud3dLoaded)return;cloud3dLoaded=true;c3el('FrameHost').hidden=false;c3el('Frame').src=CLOUD3D_URL;syncCloud3D();c3el('FrameHost').scrollIntoView({block:'start',behavior:'smooth'});}
 async function cloud3dCopy(){const source=ref;if(!source){c3el('Message').textContent=c3t('noRef');return}try{if(!navigator.clipboard?.write||typeof ClipboardItem==='undefined')throw Error('clipboard');const png=new Promise((resolve,reject)=>{const img=new Image();img.onload=()=>{try{const canvas=document.createElement('canvas');canvas.width=img.naturalWidth;canvas.height=img.naturalHeight;canvas.getContext('2d').drawImage(img,0,0);canvas.toBlob(b=>b?resolve(b):reject(Error('PNG')),'image/png')}catch(e){reject(e)}};img.onerror=reject;img.src=source});await navigator.clipboard.write([new ClipboardItem({'image/png':png})]);c3el('Message').textContent=c3t('copied');}catch{c3el('Message').textContent=c3t('copyFail');}}
 function cloud3dDownload(){if(!ref)return;const ext=ref.startsWith('data:image/jpeg')?'jpg':ref.startsWith('data:image/webp')?'webp':'png';downloadUrl(ref,'caratzon-3d-reference.'+ext);c3el('Message').textContent=c3t('downloaded');}
