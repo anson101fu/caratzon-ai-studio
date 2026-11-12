@@ -1,0 +1,1 @@
+import {authorize,json} from './_shared.js';export async function onRequestPost(ctx){const denied=await authorize(ctx);if(denied)return denied;return json({image:!!ctx.env.OPENAI_API_KEY,model:!!ctx.env.MESHY_API_KEY});}
