@@ -4,12 +4,12 @@ export async function onRequest(ctx){
  const denied=await authorize(ctx);if(denied)return denied;
  const {env,request}=ctx;const base=String(env.LOCAL_3D_URL||'').trim().replace(/\/$/,'');const token=String(env.LOCAL_3D_TOKEN||'').trim();
  if(!/^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/.test(base)||!(/^[a-f0-9]{64}$/.test(token)))return json({error:'LOCAL_NOT_CONFIGURED'},503);
- let path,opts={method:request.method,headers:{Authorization:'Bearer '+token,'User-Agent':'Caratzon-AI-Studio/4.0.1','Accept':'application/json, model/gltf-binary'},redirect:'manual',signal:AbortSignal.timeout(40000)};
+ let path,opts={method:request.method,headers:{Authorization:'Bearer '+token,'User-Agent':'Caratzon-AI-Studio/4.1','Accept':'application/json, model/gltf-binary'},redirect:'manual',signal:AbortSignal.timeout(40000)};
  const u=new URL(request.url);
  if(request.method==='POST'){
   let d;try{d=await body(request)}catch{return json({error:'BAD_IMAGE'},400)}
-  if(!validImage(d?.image)||!['pixal','trellis'].includes(d.engine)||d.consent!==true)return json({error:'BAD_IMAGE'},400);
-  path='/submit';opts.headers['Content-Type']='application/json';opts.body=JSON.stringify({image:d.image,engine:d.engine});
+  if(!validImage(d?.image)||!['pixal','trellis'].includes(d.engine)||d.consent!==true||!['fast','hd','ultra'].includes(d.quality||'ultra'))return json({error:'BAD_IMAGE'},400);
+  path='/submit';opts.headers['Content-Type']='application/json';opts.body=JSON.stringify({image:d.image,engine:d.engine,quality:d.quality||'ultra'});
  }else if(request.method==='GET'){
   const action=u.searchParams.get('action'),job=u.searchParams.get('job');
   if(action==='health')path='/health';else if(['job','file'].includes(action)&&/^[a-f0-9]{32}$/.test(job||''))path='/'+action+'/'+job;else return json({error:'BAD_REQUEST'},400);
