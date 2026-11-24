@@ -3,6 +3,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 import test_3d as core
+import tennis_geometry
 ROOT=Path(__file__).resolve().parent
 TOKEN_FILE=ROOT/'PRIVATE_BRIDGE_TOKEN.txt'
 if not TOKEN_FILE.exists(): TOKEN_FILE.write_text(secrets.token_hex(32),encoding='ascii')
@@ -91,6 +92,18 @@ def check_comfy_queue():
     q=core.req(BASE,'/queue',timeout=3)
     return bool(q.get('queue_running') or q.get('queue_pending'))
 
+def work_tennis(job,params):
+    try:
+        target=ROOT/'RESULTS'/('caratzon_tennis_'+job+'.glb')
+        stats=tennis_geometry.generate(params,target)
+        if target.stat().st_size>80*1024**2:raise RuntimeError('GLB exceeds 80 MB')
+        with LOCK:
+            JOBS[job].update(state='done',file=target,seconds=round(time.monotonic()-JOBS[job]['start'],1),bytes=stats['bytes'])
+        print('TENNIS DONE:',job,'stones:',stats['stone_count'],flush=True)
+    except Exception as e:
+        print('TENNIS FAILED:',job,str(e),flush=True)
+        with LOCK:JOBS[job].update(state='error',error='MODEL_FAILED')
+
 class Handler(BaseHTTPRequestHandler):
     def setup(self):
         super().setup();self.connection.settimeout(25)
@@ -128,6 +141,23 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         global STARTS
         if not self.allowed():return
+        if self.path=='/tennis-submit':
+            try:
+                n=int(self.headers.get('Content-Length','0'))
+                if not 0<n<=4096:raise ValueError()
+                d=json.loads(self.rfile.read(n))
+                params={k:d[k] for k in ('length_mm','stone_mm','shape','metal','clasp')}
+                if not 130<=float(params['length_mm'])<=230 or not 1.5<=float(params['stone_mm'])<=5:raise ValueError()
+                if params['shape'] not in ('round','square') or params['metal'] not in ('silver','gold','rose') or params['clasp'] not in ('box','lobster'):raise ValueError()
+            except (ValueError,KeyError,TypeError,OverflowError):self.send_json(400,{'error':'BAD_BRACELET_PARAMS'});return
+            with LOCK:
+                if STARTS>=session_limit():self.send_json(429,{'error':'SESSION_LIMIT'});return
+                if any(j['state']=='running' for j in JOBS.values()):self.send_json(409,{'error':'BUSY'});return
+                job=uuid.uuid4().hex
+                JOBS[job]={'state':'running','start':time.monotonic()}
+                STARTS+=1
+                threading.Thread(target=work_tennis,args=(job,params),daemon=True).start()
+            self.send_json(202,{'job':job});return
         if self.path=='/image-submit':
             try:
                 n=int(self.headers.get('Content-Length','0'))

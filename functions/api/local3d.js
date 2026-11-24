@@ -8,7 +8,10 @@ export async function onRequest(ctx){
  const u=new URL(request.url);
  if(request.method==='POST'){
   let d;try{d=await body(request)}catch{return json({error:'BAD_IMAGE'},400)}
-  if(u.searchParams.get('action')==='image-submit'){
+  if(u.searchParams.get('action')==='tennis-submit'){
+   if(d?.consent!==true||typeof d?.length_mm!=='number'||d.length_mm<130||d.length_mm>230||typeof d?.stone_mm!=='number'||d.stone_mm<1.5||d.stone_mm>5||!['round','square'].includes(d.shape)||!['silver','gold','rose'].includes(d.metal)||!['box','lobster'].includes(d.clasp))return json({error:'BAD_BRACELET_PARAMS'},400);
+   path='/tennis-submit';opts.headers['Content-Type']='application/json';opts.body=JSON.stringify({length_mm:d.length_mm,stone_mm:d.stone_mm,shape:d.shape,metal:d.metal,clasp:d.clasp});
+  }else if(u.searchParams.get('action')==='image-submit'){
    if(!['text','edit'].includes(d?.mode)||typeof d.prompt!=='string'||d.prompt.length<3||d.prompt.length>3000||d.consent!==true||(d.mode==='edit'&&!validImage(d.image)))return json({error:'BAD_IMAGE_REQUEST'},400);
    path='/image-submit';opts.headers['Content-Type']='application/json';opts.body=JSON.stringify({mode:d.mode,prompt:d.prompt,...(d.mode==='edit'?{image:d.image}:{})});
   }else{

@@ -2,3 +2,8 @@
 .env*
 node_modules/
 .wrangler/
+local/PRIVATE_BRIDGE_TOKEN.txt
+local/RESULTS/
+local/MAX_3D_JOBS.txt
+.caratzon_backups/
+local/test_bracelet.glb
