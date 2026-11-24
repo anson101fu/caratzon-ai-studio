@@ -10,8 +10,8 @@
 <div class="field"><label for="metal">金属材质 / 颜色</label><select id="metal"><option value="silver" selected>银色 / 925 银</option><option value="gold">18K 黄金色</option><option value="rose">玫瑰金色</option></select></div>
 <div class="field"><label for="clasp">扣位类型</label><select id="clasp"><option value="box" selected>盒扣（展示概念）</option><option value="lobster">龙虾扣（展示概念）</option></select></div>
 <div class="field"><label>估算结构</label><p class="feature" id="estimate">自动计算石粒数</p></div>
-<div class="actions"><button id="generate">✧ 生成手链 3D</button><button class="linkbtn" id="download" disabled>下载 GLB</button></div><div class="message" id="status" role="status" aria-live="polite">连接你现有的本地 Bridge（RTX 4090 服务通道）。</div>
+<div class="actions"><button id="generate">✧ 生成手链 3D</button><button class="linkbtn" id="download" disabled>下载 GLB</button><button class="linkbtn" id="downloadObj" disabled>下载 OBJ + MTL</button></div><div class="message" id="status" role="status" aria-live="polite">连接你现有的本地 Bridge（RTX 4090 服务通道）。</div>
 <p class="muted">需要登入网站测试账户并保持 Bridge + Tunnel 运行。结构化几何由电脑 CPU 计算，毋须再次调用 ComfyUI；亦不需要传送上传图片。</p></section>
-<section class="panel"><div class="bar"><h2>02 · 3D 预览</h2><span class="badge">GLB</span></div><model-viewer id="viewer" class="viewer" camera-controls auto-rotate shadow-intensity="1" exposure="1.1" camera-orbit="0deg 55deg auto" alt="网球手链 3D 模型"></model-viewer>
+<section class="panel"><div class="bar"><h2>02 · 3D 预览</h2><span class="badge">GLB / OBJ + MTL</span></div><model-viewer id="viewer" class="viewer" camera-controls auto-rotate shadow-intensity="1" exposure="1.1" camera-orbit="0deg 55deg auto" alt="网球手链 3D 模型"></model-viewer>
 <p class="warn">模型为概念预览，不是生产级 CAD。尺寸、活动铰链、扣锁公差及铸造壁厚须由珠宝 CAD 工程师审核。</p><div id="details" class="muted"></div></section></div>
 </main><script src="tennis-bracelet.js" defer></script></body></html>

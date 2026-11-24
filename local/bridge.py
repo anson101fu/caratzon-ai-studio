@@ -4,6 +4,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 import test_3d as core
 import tennis_geometry
+import tennis_obj
 ROOT=Path(__file__).resolve().parent
 TOKEN_FILE=ROOT/'PRIVATE_BRIDGE_TOKEN.txt'
 if not TOKEN_FILE.exists(): TOKEN_FILE.write_text(secrets.token_hex(32),encoding='ascii')
@@ -96,9 +97,10 @@ def work_tennis(job,params):
     try:
         target=ROOT/'RESULTS'/('caratzon_tennis_'+job+'.glb')
         stats=tennis_geometry.generate(params,target)
+        package=tennis_obj.export_package(target,target.with_suffix('.zip'))
         if target.stat().st_size>80*1024**2:raise RuntimeError('GLB exceeds 80 MB')
         with LOCK:
-            JOBS[job].update(state='done',file=target,seconds=round(time.monotonic()-JOBS[job]['start'],1),bytes=stats['bytes'])
+            JOBS[job].update(state='done',file=target,package=package,seconds=round(time.monotonic()-JOBS[job]['start'],1),bytes=stats['bytes'])
         print('TENNIS DONE:',job,'stones:',stats['stone_count'],flush=True)
     except Exception as e:
         print('TENNIS FAILED:',job,str(e),flush=True)
@@ -124,18 +126,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200,{'build':'4.1','qualities':['fast','hd','ultra'],'online':True,'busy':bool(busy or q.get('queue_running') or q.get('queue_pending')),'remaining':remaining,'limit':limit,'used':STARTS,'image_ready':all((ROOT/n).exists() for n in IMAGE_WORKFLOWS.values())})
             except Exception:self.send_json(503,{'error':'COMFY_OFFLINE'})
             return
-        m=re.fullmatch(r'/(job|file|image-job|image-file)/([a-f0-9]{32})',u.path)
+        m=re.fullmatch(r'/(job|file|image-job|image-file|tennis-package)/([a-f0-9]{32})',u.path)
         if not m:self.send_json(404,{'error':'NOT_FOUND'});return
         with LOCK: j=dict(JOBS.get(m[2],{}))
         if not j:self.send_json(404,{'error':'JOB_NOT_FOUND'});return
         if m[1] in ('job','image-job') and (m[1]=='image-job')!=(j.get('kind')=='image'):self.send_json(404,{'error':'JOB_NOT_FOUND'});return
         if m[1] in ('file','image-file') and (m[1]=='image-file')!=(j.get('kind')=='image'):self.send_json(404,{'error':'JOB_NOT_FOUND'});return
+        if m[1]=='tennis-package' and 'package' not in j and j['state']=='done':self.send_json(404,{'error':'NOT_TENNIS_JOB'});return
         if m[1] in ('job','image-job'):self.send_json(200,{'state':j['state'],'elapsed':int(time.monotonic()-j['start']),'seconds':j.get('seconds'),'bytes':j.get('bytes')});return
         if j['state']!='done':self.send_json(409,{'error':'NOT_READY'});return
-        p=j['file']
+        p=j.get('package') if m[1]=='tennis-package' else j['file']
         try:
             with p.open('rb') as f:
-                self.send_response(200);self.send_header('Content-Type','image/png' if j.get('kind')=='image' else 'model/gltf-binary');self.send_header('Content-Length',str(p.stat().st_size));self.send_header('Cache-Control','no-store');self.end_headers()
+                self.send_response(200);self.send_header('Content-Type','application/zip' if m[1]=='tennis-package' else ('image/png' if j.get('kind')=='image' else 'model/gltf-binary'));self.send_header('Content-Length',str(p.stat().st_size));self.send_header('Cache-Control','no-store');self.end_headers()
                 while chunk:=f.read(65536):self.wfile.write(chunk)
         except (OSError,ConnectionError):pass
     def do_POST(self):

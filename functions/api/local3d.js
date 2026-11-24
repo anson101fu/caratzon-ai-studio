@@ -20,10 +20,10 @@ export async function onRequest(ctx){
   }
  }else if(request.method==='GET'){
   const action=u.searchParams.get('action'),job=u.searchParams.get('job');
-  if(action==='health')path='/health';else if(['job','file','image-job','image-file'].includes(action)&&/^[a-f0-9]{32}$/.test(job||''))path='/'+action+'/'+job;else return json({error:'BAD_REQUEST'},400);
+  if(action==='health')path='/health';else if(['job','file','image-job','image-file','tennis-package'].includes(action)&&/^[a-f0-9]{32}$/.test(job||''))path='/'+action+'/'+job;else return json({error:'BAD_REQUEST'},400);
  }else return json({error:'METHOD'},405);
- if(path.startsWith('/file/')||path.startsWith('/image-file/'))opts.signal=AbortSignal.timeout(300000);
- try{const r=await fetch(base+path,opts);if(r.status>=300&&r.status<400)return json({error:'LOCAL_REDIRECT'},502);if((path.startsWith('/file/')||path.startsWith('/image-file/'))&&r.ok){const n=Number(r.headers.get('Content-Length'));if(!n||n>(path.startsWith('/image-file/')?10:80)*1024*1024||!r.body)return json({error:'FILE_SIZE'},413);return new Response(r.body,{headers:{...headers,'Content-Type':path.startsWith('/image-file/')?'image/png':'model/gltf-binary','Content-Length':String(n),...(path.startsWith('/file/')?{'X-GLB-Bytes':String(n)}:{})}});}
+ if(path.startsWith('/file/')||path.startsWith('/image-file/')||path.startsWith('/tennis-package/'))opts.signal=AbortSignal.timeout(300000);
+ try{const r=await fetch(base+path,opts);if(r.status>=300&&r.status<400)return json({error:'LOCAL_REDIRECT'},502);if((path.startsWith('/file/')||path.startsWith('/image-file/')||path.startsWith('/tennis-package/'))&&r.ok){const n=Number(r.headers.get('Content-Length'));if(!n||n>(path.startsWith('/image-file/')?10:80)*1024*1024||!r.body)return json({error:'FILE_SIZE'},413);return new Response(r.body,{headers:{...headers,'Content-Type':path.startsWith('/tennis-package/')?'application/zip':path.startsWith('/image-file/')?'image/png':'model/gltf-binary','Content-Length':String(n),...(path.startsWith('/file/')?{'X-GLB-Bytes':String(n)}:{})}});}
   const d=await r.json().catch(()=>null);if(!d||typeof d!=='object'||Array.isArray(d)){const type=r.headers.get('cf-error-type');return json({error:'LOCAL_UPSTREAM_'+r.status+(/^[0-9]{4,5}$/.test(type||'')?'_CF'+type:'')},502);}return json(d,r.ok?r.status:Math.min(599,Math.max(400,r.status)));
  }catch(e){const kind=e?.name;return json({error:kind==='TimeoutError'||kind==='AbortError'?'LOCAL_TIMEOUT':kind==='TypeError'?'LOCAL_FETCH_TYPEERROR':'LOCAL_OFFLINE'},503)}
 }
