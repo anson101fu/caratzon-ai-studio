@@ -5,6 +5,7 @@ from urllib.parse import urlsplit, parse_qs
 import test_3d as core
 import tennis_geometry
 import tennis_obj
+import quality_ai
 ROOT=Path(__file__).resolve().parent
 TOKEN_FILE=ROOT/'PRIVATE_BRIDGE_TOKEN.txt'
 if not TOKEN_FILE.exists(): TOKEN_FILE.write_text(secrets.token_hex(32),encoding='ascii')
@@ -119,6 +120,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.allowed():return
         u=urlsplit(self.path)
+        qa=re.fullmatch(r'/qa-job/([a-f0-9]{32})',u.path)
+        if qa:
+            with LOCK: j=dict(JOBS.get(qa[1],{}))
+            if j.get('kind')!='qa':self.send_json(404,{'error':'QA_JOB_NOT_FOUND'});return
+            self.send_json(200,{'state':j['state'],'result':j.get('result')});return
         if u.path=='/health':
             try:
                 q=core.req(BASE,'/queue',timeout=3)
@@ -129,7 +135,7 @@ class Handler(BaseHTTPRequestHandler):
         m=re.fullmatch(r'/(job|file|image-job|image-file|tennis-package)/([a-f0-9]{32})',u.path)
         if not m:self.send_json(404,{'error':'NOT_FOUND'});return
         with LOCK: j=dict(JOBS.get(m[2],{}))
-        if not j:self.send_json(404,{'error':'JOB_NOT_FOUND'});return
+        if not j or j.get('kind')=='qa':self.send_json(404,{'error':'JOB_NOT_FOUND'});return
         if m[1] in ('job','image-job') and (m[1]=='image-job')!=(j.get('kind')=='image'):self.send_json(404,{'error':'JOB_NOT_FOUND'});return
         if m[1] in ('file','image-file') and (m[1]=='image-file')!=(j.get('kind')=='image'):self.send_json(404,{'error':'JOB_NOT_FOUND'});return
         if m[1]=='tennis-package' and 'package' not in j and j['state']=='done':self.send_json(404,{'error':'NOT_TENNIS_JOB'});return
@@ -144,6 +150,26 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         global STARTS
         if not self.allowed():return
+        if self.path=='/qa-submit':
+            try:
+                n=int(self.headers.get('Content-Length','0'))
+                if not 0<n<=6*1024**2:raise ValueError()
+                d=json.loads(self.rfile.read(n))
+            except Exception:self.send_json(400,{'error':'BAD_QA_INPUT'});return
+            with LOCK:
+                if any(j['state']=='running' for j in JOBS.values()):self.send_json(409,{'error':'BUSY'});return
+                try:
+                    if check_comfy_queue():self.send_json(409,{'error':'BUSY'});return
+                except Exception:self.send_json(503,{'error':'COMFY_OFFLINE'});return
+                job=uuid.uuid4().hex;JOBS[job]={'state':'running','kind':'qa','start':time.monotonic()}
+            def review():
+                try: result=quality_ai.evaluate(d)
+                except Exception as e:
+                    print('Quality check unavailable:',type(e).__name__,flush=True)
+                    result={'status':'review','issues':['Local vision check unavailable; verify Ollama, model and GPU memory.']}
+                with LOCK:JOBS[job].update(state='done',result=result)
+            threading.Thread(target=review,daemon=True).start()
+            self.send_json(202,{'job':job});return
         if self.path=='/tennis-submit':
             try:
                 n=int(self.headers.get('Content-Length','0'))
