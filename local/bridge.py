@@ -1,4 +1,4 @@
-import base64, hmac, json, os, re, secrets, tempfile, threading, time, uuid
+import hashlib, base64, hmac, json, os, re, secrets, tempfile, threading, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
@@ -24,6 +24,33 @@ def session_limit():
     except (OSError, ValueError): pass
     return MAX_STARTS
 BASE=None
+TRANSFER=ROOT/'RESULTS'/'transfer444'
+TRANSFER.mkdir(parents=True,exist_ok=True)
+CHUNK=256*1024
+MAX_BODY=12*1024**2
+
+def atomic(path,data):
+    tmp=path.with_name(path.name+'.tmp');tmp.write_bytes(data);os.replace(tmp,path)
+
+def manifest(job):
+    p=TRANSFER/job/'job.json'
+    return json.loads(p.read_text()) if p.exists() else None
+
+def record(job,data):
+    atomic(TRANSFER/job/'job.json',json.dumps(data).encode())
+
+def durable_work(job,image,ext,engine,quality):
+    work(job,image,ext,engine,quality)
+    with LOCK:
+        j=JOBS[job]
+        if j['state']=='done':
+            try:
+                target=TRANSFER/job/'result.glb'
+                atomic(target,j['file'].read_bytes())
+                record(job,{'state':'done','bytes':target.stat().st_size,'seconds':j['seconds'],'sha256':hashlib.sha256(target.read_bytes()).hexdigest()})
+            except Exception:record(job,{'state':'error','error':'RESULT_SAVE_FAILED'})
+        else:record(job,{'state':'error','error':'GENERATION_FAILED'})
+
 
 def work(job,image,ext,engine,quality):
     try:
@@ -112,14 +139,76 @@ class Handler(BaseHTTPRequestHandler):
         super().setup();self.connection.settimeout(25)
     def log_message(self,*args): pass
     def send_json(self,status,data):
-        b=json.dumps(data).encode();self.send_response(status);self.send_header('Content-Type','application/json');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b)
+        try:
+            b=json.dumps(data).encode();self.send_response(status);self.send_header('Content-Type','application/json');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b)
+        except (OSError,ConnectionError):pass
     def allowed(self):
         if not hmac.compare_digest(self.headers.get('Authorization',''),'Bearer '+TOKEN):
             self.send_json(401,{'error':'UNAUTHORIZED'});return False
         return True
+    def transfer_get(self,u):
+        m=re.fullmatch(r'/transfer/(status|chunk)/([a-f0-9]{32})(?:/([0-9]{1,4}))?',u.path)
+        if not m:return False
+        action,job,index=m.groups()
+        with LOCK:
+            d=manifest(job)
+            if d and d['state']=='running' and job not in JOBS:d={'state':'error','error':'BRIDGE_RESTARTED_NO_AUTO_REPLAY'}
+            if action=='status':
+                if d and d['state']=='running':d={**d,'elapsed':int(time.monotonic()-JOBS[job]['start'])}
+                self.send_json(200,d or {'state':'uploading','received':[int(x.name[4:]) for x in (TRANSFER/job).glob('part*') if re.fullmatch(r'part[0-9]+',x.name)]});return True
+            if not d or d['state']!='done' or index is None:self.send_json(409,{'error':'NOT_READY'});return True
+            offset=int(index)*CHUNK
+            if offset>=d['bytes']:self.send_json(416,{'error':'BAD_RANGE'});return True
+            with (TRANSFER/job/'result.glb').open('rb') as f:f.seek(offset);b=f.read(CHUNK)
+        self.send_json(200,{'data':base64.b64encode(b).decode(),'sha256':hashlib.sha256(b).hexdigest()});return True
+    def transfer_post(self):
+        global STARTS
+        m=re.fullmatch(r'/transfer/(upload|commit)/([a-f0-9]{32})(?:/([0-9]{1,3}))?',self.path)
+        if not m:return False
+        action,job,index=m.groups()
+        try:
+            n=int(self.headers.get('Content-Length','0'))
+            if not 0<n<=400000:raise ValueError()
+            raw=self.rfile.read(n)
+            if len(raw)!=n:raise ValueError()
+            d=json.loads(raw)
+            folder=TRANSFER/job
+            with LOCK:
+                existing=manifest(job)
+                if existing:self.send_json(200,{'job':job,'state':existing['state']});return True
+                if not folder.exists() and sum(1 for _ in TRANSFER.iterdir())>=1000:self.send_json(507,{'error':'TRANSFER_STORAGE_LIMIT'});return True
+                folder.mkdir(exist_ok=True)
+                if action=='upload':
+                    if index is None or int(index)>=48:raise ValueError()
+                    b=base64.b64decode(d['data'],validate=True)
+                    if not 0<len(b)<=CHUNK or hashlib.sha256(b).hexdigest()!=d['sha256']:raise ValueError()
+                    path=folder/('part'+str(int(index)))
+                    if path.exists() and path.read_bytes()!=b:self.send_json(409,{'error':'CHUNK_CONFLICT'});return True
+                    atomic(path,b);self.send_json(200,{'ok':True});return True
+                count=d['count'];size=d['size']
+                if type(count)!=int or type(size)!=int or not 0<size<=MAX_BODY or count!=(size+CHUNK-1)//CHUNK:raise ValueError()
+                parts=[(folder/('part'+str(i))).read_bytes() for i in range(count)]
+                raw=b''.join(parts)
+                if len(raw)!=size or hashlib.sha256(raw).hexdigest()!=d['sha256']:raise ValueError()
+                data=json.loads(raw);engine=data['engine'];quality=data['quality']
+                match=re.fullmatch(r'data:image/(png|jpeg|webp);base64,([A-Za-z0-9+/=]+)',data['image'])
+                if not match or data.get('consent') is not True or engine not in ('pixal','trellis') or quality not in core.PRESETS:raise ValueError()
+                image=base64.b64decode(match[2],validate=True);ext={'png':'.png','jpeg':'.jpg','webp':'.webp'}[match[1]]
+                if not 0<len(image)<=core.MAX_IMAGE or not ((ext=='.png' and image.startswith(b'\x89PNG\r\n\x1a\n')) or (ext=='.jpg' and image.startswith(b'\xff\xd8\xff')) or (ext=='.webp' and image[:4]==b'RIFF' and image[8:12]==b'WEBP')):raise ValueError()
+                if STARTS>=session_limit():self.send_json(429,{'error':'SESSION_LIMIT'});return True
+                if any(j['state']=='running' for j in JOBS.values()):self.send_json(409,{'error':'BUSY'});return True
+                try:
+                    if check_comfy_queue():self.send_json(409,{'error':'BUSY'});return True
+                except Exception:self.send_json(503,{'error':'COMFY_OFFLINE'});return True
+                record(job,{'state':'running'});JOBS[job]={'state':'running','start':time.monotonic()};STARTS+=1
+                for i in range(count):(folder/('part'+str(i))).unlink(missing_ok=True)
+                threading.Thread(target=durable_work,args=(job,image,ext,engine,quality),daemon=True).start()
+                self.send_json(202,{'job':job,'state':'running'});return True
+        except (ValueError,KeyError,TypeError,OSError):self.send_json(400,{'error':'BAD_TRANSFER_OR_INCOMPLETE'});return True
     def do_GET(self):
         if not self.allowed():return
         u=urlsplit(self.path)
+        if self.transfer_get(u):return
         qa=re.fullmatch(r'/qa-job/([a-f0-9]{32})',u.path)
         if qa:
             with LOCK: j=dict(JOBS.get(qa[1],{}))
@@ -129,7 +218,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 q=core.req(BASE,'/queue',timeout=3)
                 with LOCK: busy=any(j['state']=='running' for j in JOBS.values()); limit=session_limit(); remaining=max(0,limit-STARTS)
-                self.send_json(200,{'build':'4.1','qualities':['fast','hd','ultra'],'online':True,'busy':bool(busy or q.get('queue_running') or q.get('queue_pending')),'remaining':remaining,'limit':limit,'used':STARTS,'image_ready':all((ROOT/n).exists() for n in IMAGE_WORKFLOWS.values())})
+                self.send_json(200,{'build':'4.1','transfer444':True,'qualities':['fast','hd','ultra'],'online':True,'busy':bool(busy or q.get('queue_running') or q.get('queue_pending')),'remaining':remaining,'limit':limit,'used':STARTS,'image_ready':all((ROOT/n).exists() for n in IMAGE_WORKFLOWS.values())})
             except Exception:self.send_json(503,{'error':'COMFY_OFFLINE'})
             return
         m=re.fullmatch(r'/(job|file|image-job|image-file|tennis-package)/([a-f0-9]{32})',u.path)
@@ -150,6 +239,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         global STARTS
         if not self.allowed():return
+        if self.transfer_post():return
         if self.path=='/qa-submit':
             try:
                 n=int(self.headers.get('Content-Length','0'))
