@@ -1,4 +1,4 @@
-import hashlib, base64, hmac, json, os, re, secrets, tempfile, threading, time, uuid
+import queue, hashlib, base64, hmac, json, os, re, secrets, tempfile, threading, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
@@ -14,6 +14,33 @@ if not re.fullmatch(r'[0-9a-f]{64}',TOKEN): raise RuntimeError('Invalid bridge t
 LOCK=threading.Lock(); JOBS={}; STARTS=0
 MAX_STARTS_FILE=ROOT/'MAX_3D_JOBS.txt'
 MAX_STARTS=10
+MAX_ACTIVE=5
+TASKS=queue.Queue()
+
+def active_count():
+    return sum(j["state"]=="running" for j in JOBS.values())
+
+def enqueue(fn,args,job):
+    JOBS[job]["queued"]=True
+    TASKS.put((fn,args,job))
+
+def worker455():
+    while True:
+        fn,args,job=TASKS.get()
+        try:
+            deadline=time.monotonic()+3600
+            while check_comfy_queue():
+                if time.monotonic()>deadline:raise RuntimeError("External GPU queue timeout")
+                time.sleep(2)
+            with LOCK:JOBS[job].update(queued=False, start=time.monotonic())
+            fn(*args)
+        except Exception as e:
+            with LOCK:
+                JOBS[job].update(state="error",queued=False,error="QUEUE_EXECUTION_FAILED")
+                if manifest(job):record(job,{"state":"error","error":"QUEUE_EXECUTION_FAILED"})
+            print("Queue job failed:",type(e).__name__,flush=True)
+        finally:TASKS.task_done()
+
 
 def session_limit():
     # Called under LOCK by requests. Invalid edits retain the last valid limit.
@@ -154,7 +181,7 @@ class Handler(BaseHTTPRequestHandler):
             d=manifest(job)
             if d and d['state']=='running' and job not in JOBS:d={'state':'error','error':'BRIDGE_RESTARTED_NO_AUTO_REPLAY'}
             if action=='status':
-                if d and d['state']=='running':d={**d,'elapsed':int(time.monotonic()-JOBS[job]['start'])}
+                if d and d['state']=='running':d={**d,'elapsed':int(time.monotonic()-JOBS[job]['start']),'queued':JOBS[job].get('queued',False)}
                 self.send_json(200,d or {'state':'uploading','received':[int(x.name[4:]) for x in (TRANSFER/job).glob('part*') if re.fullmatch(r'part[0-9]+',x.name)]});return True
             if not d or d['state']!='done' or index is None:self.send_json(409,{'error':'NOT_READY'});return True
             offset=int(index)*CHUNK
@@ -196,13 +223,13 @@ class Handler(BaseHTTPRequestHandler):
                 image=base64.b64decode(match[2],validate=True);ext={'png':'.png','jpeg':'.jpg','webp':'.webp'}[match[1]]
                 if not 0<len(image)<=core.MAX_IMAGE or not ((ext=='.png' and image.startswith(b'\x89PNG\r\n\x1a\n')) or (ext=='.jpg' and image.startswith(b'\xff\xd8\xff')) or (ext=='.webp' and image[:4]==b'RIFF' and image[8:12]==b'WEBP')):raise ValueError()
                 if STARTS>=session_limit():self.send_json(429,{'error':'SESSION_LIMIT'});return True
-                if any(j['state']=='running' for j in JOBS.values()):self.send_json(409,{'error':'BUSY'});return True
+                if active_count()>=MAX_ACTIVE:self.send_json(409,{'error':'BUSY'});return True
                 try:
-                    if check_comfy_queue():self.send_json(409,{'error':'BUSY'});return True
+                    check_comfy_queue()
                 except Exception:self.send_json(503,{'error':'COMFY_OFFLINE'});return True
                 record(job,{'state':'running'});JOBS[job]={'state':'running','start':time.monotonic()};STARTS+=1
                 for i in range(count):(folder/('part'+str(i))).unlink(missing_ok=True)
-                threading.Thread(target=durable_work,args=(job,image,ext,engine,quality),daemon=True).start()
+                enqueue(durable_work,(job,image,ext,engine,quality),job)
                 self.send_json(202,{'job':job,'state':'running'});return True
         except (ValueError,KeyError,TypeError,OSError):self.send_json(400,{'error':'BAD_TRANSFER_OR_INCOMPLETE'});return True
     def do_GET(self):
@@ -213,12 +240,12 @@ class Handler(BaseHTTPRequestHandler):
         if qa:
             with LOCK: j=dict(JOBS.get(qa[1],{}))
             if j.get('kind')!='qa':self.send_json(404,{'error':'QA_JOB_NOT_FOUND'});return
-            self.send_json(200,{'state':j['state'],'result':j.get('result')});return
+            self.send_json(200,{'state':j['state'],'queued':j.get('queued',False),'result':j.get('result')});return
         if u.path=='/health':
             try:
                 q=core.req(BASE,'/queue',timeout=3)
-                with LOCK: busy=any(j['state']=='running' for j in JOBS.values()); limit=session_limit(); remaining=max(0,limit-STARTS)
-                self.send_json(200,{'build':'4.1','transfer444':True,'qualities':['fast','hd','ultra'],'online':True,'busy':bool(busy or q.get('queue_running') or q.get('queue_pending')),'remaining':remaining,'limit':limit,'used':STARTS,'image_ready':all((ROOT/n).exists() for n in IMAGE_WORKFLOWS.values())})
+                with LOCK: active=active_count(); busy=active>=MAX_ACTIVE; limit=session_limit(); remaining=max(0,limit-STARTS)
+                self.send_json(200,{'build':'4.1','transfer444':True,'qualities':['fast','hd','ultra'],'online':True,'busy':busy,'active_jobs':active,'max_active_jobs':MAX_ACTIVE,'remaining':remaining,'limit':limit,'used':STARTS,'image_ready':all((ROOT/n).exists() for n in IMAGE_WORKFLOWS.values())})
             except Exception:self.send_json(503,{'error':'COMFY_OFFLINE'})
             return
         m=re.fullmatch(r'/(job|file|image-job|image-file|tennis-package)/([a-f0-9]{32})',u.path)
@@ -228,7 +255,7 @@ class Handler(BaseHTTPRequestHandler):
         if m[1] in ('job','image-job') and (m[1]=='image-job')!=(j.get('kind')=='image'):self.send_json(404,{'error':'JOB_NOT_FOUND'});return
         if m[1] in ('file','image-file') and (m[1]=='image-file')!=(j.get('kind')=='image'):self.send_json(404,{'error':'JOB_NOT_FOUND'});return
         if m[1]=='tennis-package' and 'package' not in j and j['state']=='done':self.send_json(404,{'error':'NOT_TENNIS_JOB'});return
-        if m[1] in ('job','image-job'):self.send_json(200,{'state':j['state'],'elapsed':int(time.monotonic()-j['start']),'seconds':j.get('seconds'),'bytes':j.get('bytes')});return
+        if m[1] in ('job','image-job'):self.send_json(200,{'state':j['state'],'elapsed':int(time.monotonic()-j['start']),'queued':j.get('queued',False),'seconds':j.get('seconds'),'bytes':j.get('bytes')});return
         if j['state']!='done':self.send_json(409,{'error':'NOT_READY'});return
         p=j.get('package') if m[1]=='tennis-package' else j['file']
         try:
@@ -247,9 +274,9 @@ class Handler(BaseHTTPRequestHandler):
                 d=json.loads(self.rfile.read(n))
             except Exception:self.send_json(400,{'error':'BAD_QA_INPUT'});return
             with LOCK:
-                if any(j['state']=='running' for j in JOBS.values()):self.send_json(409,{'error':'BUSY'});return
+                if active_count()>=MAX_ACTIVE:self.send_json(409,{'error':'BUSY'});return
                 try:
-                    if check_comfy_queue():self.send_json(409,{'error':'BUSY'});return
+                    check_comfy_queue()
                 except Exception:self.send_json(503,{'error':'COMFY_OFFLINE'});return
                 job=uuid.uuid4().hex;JOBS[job]={'state':'running','kind':'qa','start':time.monotonic()}
             def review():
@@ -258,7 +285,7 @@ class Handler(BaseHTTPRequestHandler):
                     print('Quality check unavailable:',type(e).__name__,flush=True)
                     result={'status':'review','issues':['Local vision check unavailable; verify Ollama, model and GPU memory.']}
                 with LOCK:JOBS[job].update(state='done',result=result)
-            threading.Thread(target=review,daemon=True).start()
+            with LOCK:enqueue(review,(),job)
             self.send_json(202,{'job':job});return
         if self.path=='/tennis-submit':
             try:
@@ -271,11 +298,11 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError,KeyError,TypeError,OverflowError):self.send_json(400,{'error':'BAD_BRACELET_PARAMS'});return
             with LOCK:
                 if STARTS>=session_limit():self.send_json(429,{'error':'SESSION_LIMIT'});return
-                if any(j['state']=='running' for j in JOBS.values()):self.send_json(409,{'error':'BUSY'});return
+                if active_count()>=MAX_ACTIVE:self.send_json(409,{'error':'BUSY'});return
                 job=uuid.uuid4().hex
                 JOBS[job]={'state':'running','start':time.monotonic()}
                 STARTS+=1
-                threading.Thread(target=work_tennis,args=(job,params),daemon=True).start()
+                enqueue(work_tennis,(job,params),job)
             self.send_json(202,{'job':job});return
         if self.path=='/image-submit':
             try:
@@ -295,15 +322,15 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:self.send_json(400,{'error':'BAD_IMAGE_REQUEST'});return
             with LOCK:
                 if STARTS>=session_limit():self.send_json(429,{'error':'SESSION_LIMIT'});return
-                if any(j['state']=='running' for j in JOBS.values()):self.send_json(409,{'error':'BUSY'});return
+                if active_count()>=MAX_ACTIVE:self.send_json(409,{'error':'BUSY'});return
                 try:
-                    if check_comfy_queue():self.send_json(409,{'error':'BUSY'});return
+                    check_comfy_queue()
                 except Exception:self.send_json(503,{'error':'COMFY_OFFLINE'});return
                 if not (ROOT/IMAGE_WORKFLOWS[mode]).exists():self.send_json(503,{'error':'IMAGE_WORKFLOW_MISSING'});return
                 job=uuid.uuid4().hex
                 JOBS[job]={'state':'running','kind':'image','start':time.monotonic()}
                 STARTS+=1
-                threading.Thread(target=work_image,args=(job,prompt,image,ext),daemon=True).start()
+                enqueue(work_image,(job,prompt,image,ext),job)
             self.send_json(202,{'job':job});return
         if self.path!='/submit':self.send_json(404,{'error':'NOT_FOUND'});return
         try:
@@ -317,17 +344,18 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:self.send_json(400,{'error':'BAD_IMAGE'});return
         with LOCK:
             if STARTS>=session_limit():self.send_json(429,{'error':'SESSION_LIMIT'});return
-            if any(j['state']=='running' for j in JOBS.values()):self.send_json(409,{'error':'BUSY'});return
+            if active_count()>=MAX_ACTIVE:self.send_json(409,{'error':'BUSY'});return
             try:
                 q=core.req(BASE,'/queue',timeout=3)
-                if q.get('queue_running') or q.get('queue_pending'):self.send_json(409,{'error':'BUSY'});return
+                
             except Exception:self.send_json(503,{'error':'COMFY_OFFLINE'});return
             job=uuid.uuid4().hex;JOBS[job]={'state':'running','start':time.monotonic()};STARTS+=1
-            threading.Thread(target=work,args=(job,image,ext,engine,quality),daemon=True).start()
+            enqueue(work,(job,image,ext,engine,quality),job)
         self.send_json(202,{'job':job})
 
 if __name__=='__main__':
     BASE,s=core.find_server()
     if not any('4090' in str(d.get('name','')) for d in s.get('devices',[]) if isinstance(d,dict)):raise RuntimeError('RTX 4090 not detected')
-    print('CARATZON V4.1 PRIVATE BRIDGE\nComfyUI:',BASE,'\nBridge: http://127.0.0.1:8765\nPrivate token file:',TOKEN_FILE,'\n',session_limit(),'jobs per session; edit MAX_3D_JOBS.txt to change. One at a time. Keep this window open.\nDo NOT share the token or tunnel URL publicly.',flush=True)
+    print('CARATZON V4.1 PRIVATE BRIDGE\nComfyUI:',BASE,'\nBridge: http://127.0.0.1:8765\nPrivate token file:',TOKEN_FILE,'\n',session_limit(),'jobs per session; edit MAX_3D_JOBS.txt to change. Up to five outstanding jobs; one GPU worker. Keep this window open.\nDo NOT share the token or tunnel URL publicly.',flush=True)
+    threading.Thread(target=worker455,daemon=True).start()
     ThreadingHTTPServer(('127.0.0.1',8765),Handler).serve_forever()
