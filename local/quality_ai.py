@@ -14,7 +14,7 @@ def evaluate(d):
         encoded.append(m[1])
     prompt=RULES+'\nMode: '+mode+'\nEvidence order and customer requirements: '+brief
     if mode=='stonefree':prompt+='\nPass only when no gemstones are visibly present anywhere; if hidden details or uncertainty, review. No guessing.'
-    if mode=='production':prompt+='\nThe candidate views must have no gems, intact metal shoulders and empty seats; any missing metal is fail.'
+    if mode in ('production','mounting'):prompt+='\nCompare item count, paired earrings, prong positions, upper and lower stone supports, shoulders, bezel rims and connectors against original. Fail visible missing metal or residual gems; review unclear details. Never invent geometry or approve based on symmetry alone.'
     req=urllib.request.Request('http://127.0.0.1:11434/api/chat',data=json.dumps({'model':MODEL,'messages':[{'role':'user','content':prompt,'images':encoded}],'stream':False,'format':'json','keep_alive':0,'options':{'temperature':0,'num_predict':400,'num_ctx':8192}}).encode(),headers={'Content-Type':'application/json'})
     with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req,timeout=240) as r: out=json.loads(r.read(1000000))
     a=json.loads(out['message']['content']);status=a.get('status');issues=a.get('issues')
