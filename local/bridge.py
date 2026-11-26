@@ -1,4 +1,4 @@
-import queue, hashlib, base64, hmac, json, os, re, secrets, tempfile, threading, time, uuid
+import hashlib, base64, hmac, json, os, re, secrets, tempfile, threading, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
@@ -6,6 +6,7 @@ import test_3d as core
 import tennis_geometry
 import tennis_obj
 import quality_ai
+import batch456
 ROOT=Path(__file__).resolve().parent
 TOKEN_FILE=ROOT/'PRIVATE_BRIDGE_TOKEN.txt'
 if not TOKEN_FILE.exists(): TOKEN_FILE.write_text(secrets.token_hex(32),encoding='ascii')
@@ -15,31 +16,127 @@ LOCK=threading.Lock(); JOBS={}; STARTS=0
 MAX_STARTS_FILE=ROOT/'MAX_3D_JOBS.txt'
 MAX_STARTS=10
 MAX_ACTIVE=5
-TASKS=queue.Queue()
+# No waiting queue. Each explicitly provisioned ComfyUI backend has one slot.
+# Default is the single existing RTX 4090 backend. Extra backends must be
+# provisioned and stress-tested separately; never start extra GPU processes here.
+BACKENDS=[]
+RESERVED={}
+BATCH_LIMIT=1
+BATCH_OPEN=None
+BATCH_WINDOW=2.0
 
 def active_count():
-    return sum(j["state"]=="running" for j in JOBS.values())
+    return len(RESERVED)
 
-def enqueue(fn,args,job):
-    JOBS[job]["queued"]=True
-    TASKS.put((fn,args,job))
-
-def worker455():
-    while True:
-        fn,args,job=TASKS.get()
+def reserve(kind):
+    # Called with LOCK held. QA/3D/tennis are exclusive to avoid memory overlap.
+    if len(RESERVED)>=MAX_ACTIVE:return None
+    if any(k=='batch_text' for _,k in RESERVED.values()):return None
+    if kind!='image' and RESERVED:return None
+    if any(k!='image' for _,k in RESERVED.values()):return None
+    candidates=BACKENDS if kind=='image' else [BASE]
+    for url in candidates:
+        if any(u==url for u,_ in RESERVED.values()):continue
         try:
-            deadline=time.monotonic()+3600
-            while check_comfy_queue():
-                if time.monotonic()>deadline:raise RuntimeError("External GPU queue timeout")
-                time.sleep(2)
-            with LOCK:JOBS[job].update(queued=False, start=time.monotonic())
-            fn(*args)
+            q=core.req(url,'/queue',timeout=3)
+            if q.get('queue_running') or q.get('queue_pending'):continue
+        except Exception:continue
+        return url
+    return None
+
+def launch(fn,args,job,url,kind):
+    RESERVED[job]=(url,kind)
+    JOBS[job]['queued']=False
+    def runner():
+        try:
+            fn(*args,backend=url) if kind=='image' else fn(*args)
         except Exception as e:
             with LOCK:
-                JOBS[job].update(state="error",queued=False,error="QUEUE_EXECUTION_FAILED")
-                if manifest(job):record(job,{"state":"error","error":"QUEUE_EXECUTION_FAILED"})
-            print("Queue job failed:",type(e).__name__,flush=True)
-        finally:TASKS.task_done()
+                JOBS[job].update(state='error',error='EXECUTION_FAILED')
+                if manifest(job):record(job,{'state':'error','error':'EXECUTION_FAILED'})
+            print('Job failed:',type(e).__name__,flush=True)
+        finally:
+            with LOCK:RESERVED.pop(job,None)
+    threading.Thread(target=runner,daemon=True).start()
+
+def batch_capacity():
+    if BATCH_LIMIT<=1:return len(BACKENDS)
+    if not RESERVED:return BATCH_LIMIT
+    if BATCH_OPEN is not None and time.monotonic()<BATCH_OPEN['deadline']:
+        return BATCH_LIMIT
+    return 0
+
+def batch_offer(job,prompt):
+    # Caller holds LOCK. Collect briefly into one GPU execution, not a serial queue.
+    global BATCH_OPEN
+    if BATCH_LIMIT<=1:return False
+    if BATCH_OPEN is None:
+        if RESERVED or reserve('image')!=BASE:return False
+        group={'deadline':time.monotonic()+BATCH_WINDOW,'entries':[], 'event':threading.Event()}
+        BATCH_OPEN=group
+        first=True
+    else:
+        group=BATCH_OPEN;first=False
+        if time.monotonic()>=group['deadline'] or len(group['entries'])>=BATCH_LIMIT:return False
+    group['entries'].append((job,prompt))
+    RESERVED[job]=(BASE,'batch_text')
+    JOBS[job]={'state':'running','kind':'image','start':time.monotonic(),'phase':'collecting','queued':False}
+    if len(group['entries'])>=BATCH_LIMIT:group['event'].set()
+    if first:threading.Thread(target=batch_runner,args=(group,),daemon=True).start()
+    return True
+
+def batch_runner(group):
+    global BATCH_OPEN
+    group['event'].wait(max(0,group['deadline']-time.monotonic()))
+    with LOCK:
+        if BATCH_OPEN is group:BATCH_OPEN=None
+        entries=list(group['entries'])
+        for job,_ in entries:JOBS[job].update(phase='running',start=time.monotonic())
+    try:
+        if len(entries)==1:
+            job,prompt=entries[0];work_image(job,prompt,None,None,backend=BASE)
+        else:
+            print('BATCH456 sampling',len(entries),'independent text prompts',flush=True)
+            workflow=json.loads((ROOT/IMAGE_WORKFLOWS['text']).read_text(encoding='utf-8-sig'))
+            results=batch456.run_batch(core.req,BASE,workflow,entries,ROOT/'RESULTS')
+            with LOCK:
+                for job,_ in entries:
+                    target=results.get(job)
+                    if target is None:JOBS[job].update(state='error',phase='error',error='BATCH_OUTPUT_FAILED')
+                    else:JOBS[job].update(state='done',phase='done',file=target,seconds=round(time.monotonic()-JOBS[job]['start'],1),bytes=target.stat().st_size)
+            print('BATCH456 complete',len(entries),flush=True)
+    except Exception as e:
+        print('BATCH456 failed:',type(e).__name__,str(e)[:250],flush=True)
+        with LOCK:
+            for job,_ in entries:JOBS[job].update(state='error',phase='error',error='BATCH_GPU_FAILED')
+    finally:
+        with LOCK:
+            for job,_ in entries:RESERVED.pop(job,None)
+
+
+def load_batch_limit():
+    path=ROOT/'BATCH_456_TESTED.json'
+    if not path.exists() or len(BACKENDS)!=1:return 1
+    try:
+        data=json.loads(path.read_text(encoding='utf-8-sig'));n=data['tested_max']
+        if type(n)!=int or not 2<=n<=5 or data.get('enabled') is not True:raise ValueError()
+        fp=hashlib.sha256((ROOT/IMAGE_WORKFLOWS['text']).read_bytes()).hexdigest()
+        if data.get('workflow_sha256')!=fp or not batch456.available(core.req,BASE):raise ValueError()
+        return n
+    except Exception:
+        print('Batch disabled: run the actual GPU test and verify the custom node first.',flush=True);return 1
+
+def load_backends():
+    out=[BASE]
+    cfg=ROOT/'IMAGE_BACKENDS_456.json'
+    if cfg.exists():
+        data=json.loads(cfg.read_text(encoding='utf-8-sig'))
+        for url in data.get('additional_backends',[]):
+            if not isinstance(url,str) or not re.fullmatch(r'http://127\.0\.0\.1:[0-9]{1,5}',url):raise ValueError('Only explicit loopback HTTP backends allowed')
+            if not 1<=int(url.rsplit(':',1)[1])<=65535:raise ValueError('Invalid port')
+            if url not in out:out.append(url)
+        if len(out)>MAX_ACTIVE:raise ValueError('At most five backends')
+    return out
 
 
 def session_limit():
@@ -96,7 +193,8 @@ def work(job,image,ext,engine,quality):
 IMAGE_LIMIT=10*1024*1024
 IMAGE_WORKFLOWS={'text':'flux2_text_to_image.json','edit':'flux2_image_edit.json'}
 
-def run_image(job,prompt,image=None,ext=None):
+def run_image(job,prompt,image=None,ext=None,backend=None):
+    backend=backend or BASE
     import copy
     filename=IMAGE_WORKFLOWS['edit' if image else 'text']
     workflow=json.loads((ROOT/filename).read_text(encoding='utf-8-sig'))
@@ -107,14 +205,14 @@ def run_image(job,prompt,image=None,ext=None):
         with tempfile.TemporaryDirectory() as td:
             path=Path(td)/('reference'+ext)
             path.write_bytes(image)
-            uploadname=core.upload(BASE,path,job)
+            uploadname=core.upload(backend,path,job)
         workflow['76']['inputs']['image']=uploadname
-    submit=core.req(BASE,'/prompt',json.dumps({'prompt':workflow,'client_id':uuid.uuid4().hex}).encode(),{'Content-Type':'application/json'},timeout=60)
+    submit=core.req(backend,'/prompt',json.dumps({'prompt':workflow,'client_id':uuid.uuid4().hex}).encode(),{'Content-Type':'application/json'},timeout=60)
     pid=submit.get('prompt_id')
     if not pid: raise RuntimeError('ComfyUI did not accept image job')
     end=time.monotonic()+900
     while time.monotonic()<end:
-        history=core.req(BASE,'/history/'+pid,timeout=30)
+        history=core.req(backend,'/history/'+pid,timeout=30)
         if pid in history:
             entry=history[pid]
             status=entry.get('status',{})
@@ -126,7 +224,7 @@ def run_image(job,prompt,image=None,ext=None):
                     from urllib.parse import urlencode
                     url='/view?'+urlencode({'filename':f['filename'],'subfolder':f.get('subfolder',''),'type':'output'})
                     # Local ComfyUI: read only returned PNG output (max 10 MiB).
-                    imagebytes=core.req(BASE,url,timeout=120,binary=True)
+                    imagebytes=core.req(backend,url,timeout=120,binary=True)
                     if not imagebytes.startswith(b'\x89PNG\r\n\x1a\n') or len(imagebytes)>IMAGE_LIMIT:raise RuntimeError('Invalid image output')
                     folder=ROOT/'RESULTS';folder.mkdir(exist_ok=True)
                     path=folder/('caratzon_2d_'+job+'.png');path.write_bytes(imagebytes)
@@ -135,9 +233,9 @@ def run_image(job,prompt,image=None,ext=None):
         time.sleep(1)
     raise RuntimeError('Image generation timeout')
 
-def work_image(job,prompt,image,ext):
+def work_image(job,prompt,image,ext,backend=None):
     try:
-        target=run_image(job,prompt,image,ext)
+        target=run_image(job,prompt,image,ext,backend)
         with LOCK:JOBS[job].update(state='done',file=target,seconds=round(time.monotonic()-JOBS[job]['start'],1),bytes=target.stat().st_size,kind='image')
         print('IMAGE DONE:',job,flush=True)
     except Exception as e:
@@ -223,13 +321,14 @@ class Handler(BaseHTTPRequestHandler):
                 image=base64.b64decode(match[2],validate=True);ext={'png':'.png','jpeg':'.jpg','webp':'.webp'}[match[1]]
                 if not 0<len(image)<=core.MAX_IMAGE or not ((ext=='.png' and image.startswith(b'\x89PNG\r\n\x1a\n')) or (ext=='.jpg' and image.startswith(b'\xff\xd8\xff')) or (ext=='.webp' and image[:4]==b'RIFF' and image[8:12]==b'WEBP')):raise ValueError()
                 if STARTS>=session_limit():self.send_json(429,{'error':'SESSION_LIMIT'});return True
-                if active_count()>=MAX_ACTIVE:self.send_json(409,{'error':'BUSY'});return True
+                url=reserve('3d')
+                if url is None:self.send_json(409,{'error':'BUSY'});return True
                 try:
                     check_comfy_queue()
                 except Exception:self.send_json(503,{'error':'COMFY_OFFLINE'});return True
                 record(job,{'state':'running'});JOBS[job]={'state':'running','start':time.monotonic()};STARTS+=1
                 for i in range(count):(folder/('part'+str(i))).unlink(missing_ok=True)
-                enqueue(durable_work,(job,image,ext,engine,quality),job)
+                launch(durable_work,(job,image,ext,engine,quality),job,url,'3d')
                 self.send_json(202,{'job':job,'state':'running'});return True
         except (ValueError,KeyError,TypeError,OSError):self.send_json(400,{'error':'BAD_TRANSFER_OR_INCOMPLETE'});return True
     def do_GET(self):
@@ -244,8 +343,9 @@ class Handler(BaseHTTPRequestHandler):
         if u.path=='/health':
             try:
                 q=core.req(BASE,'/queue',timeout=3)
-                with LOCK: active=active_count(); busy=active>=MAX_ACTIVE; limit=session_limit(); remaining=max(0,limit-STARTS)
-                self.send_json(200,{'build':'4.1','transfer444':True,'qualities':['fast','hd','ultra'],'online':True,'busy':busy,'active_jobs':active,'max_active_jobs':MAX_ACTIVE,'remaining':remaining,'limit':limit,'used':STARTS,'image_ready':all((ROOT/n).exists() for n in IMAGE_WORKFLOWS.values())})
+                with LOCK:
+                    active=active_count(); capacity=batch_capacity(); busy=active>=capacity or any(k not in ('image','batch_text') for _,k in RESERVED.values()); limit=session_limit(); remaining=max(0,limit-STARTS)
+                self.send_json(200,{'build':'4.1','transfer444':True,'qualities':['fast','hd','ultra'],'online':True,'busy':busy,'active_jobs':active,'max_active_jobs':max(BATCH_LIMIT,len(BACKENDS)),'execution_mode':'text-batch-window' if BATCH_LIMIT>1 else 'independent-backends-no-queue','max_image_slots':max(BATCH_LIMIT,len(BACKENDS)),'batch_text_limit':BATCH_LIMIT,'batch_collecting':BATCH_OPEN is not None,'batch_window_seconds':BATCH_WINDOW if BATCH_LIMIT>1 else 0,'remaining':remaining,'limit':limit,'used':STARTS,'image_ready':all((ROOT/n).exists() for n in IMAGE_WORKFLOWS.values())})
             except Exception:self.send_json(503,{'error':'COMFY_OFFLINE'})
             return
         m=re.fullmatch(r'/(job|file|image-job|image-file|tennis-package)/([a-f0-9]{32})',u.path)
@@ -255,7 +355,7 @@ class Handler(BaseHTTPRequestHandler):
         if m[1] in ('job','image-job') and (m[1]=='image-job')!=(j.get('kind')=='image'):self.send_json(404,{'error':'JOB_NOT_FOUND'});return
         if m[1] in ('file','image-file') and (m[1]=='image-file')!=(j.get('kind')=='image'):self.send_json(404,{'error':'JOB_NOT_FOUND'});return
         if m[1]=='tennis-package' and 'package' not in j and j['state']=='done':self.send_json(404,{'error':'NOT_TENNIS_JOB'});return
-        if m[1] in ('job','image-job'):self.send_json(200,{'state':j['state'],'elapsed':int(time.monotonic()-j['start']),'queued':j.get('queued',False),'seconds':j.get('seconds'),'bytes':j.get('bytes')});return
+        if m[1] in ('job','image-job'):self.send_json(200,{'state':j['state'],'elapsed':int(time.monotonic()-j['start']),'queued':j.get('queued',False),'phase':j.get('phase'),'error':j.get('error'),'seconds':j.get('seconds'),'bytes':j.get('bytes')});return
         if j['state']!='done':self.send_json(409,{'error':'NOT_READY'});return
         p=j.get('package') if m[1]=='tennis-package' else j['file']
         try:
@@ -274,18 +374,19 @@ class Handler(BaseHTTPRequestHandler):
                 d=json.loads(self.rfile.read(n))
             except Exception:self.send_json(400,{'error':'BAD_QA_INPUT'});return
             with LOCK:
-                if active_count()>=MAX_ACTIVE:self.send_json(409,{'error':'BUSY'});return
+                url=reserve('qa')
+                if url is None:self.send_json(409,{'error':'BUSY'});return
                 try:
                     check_comfy_queue()
                 except Exception:self.send_json(503,{'error':'COMFY_OFFLINE'});return
                 job=uuid.uuid4().hex;JOBS[job]={'state':'running','kind':'qa','start':time.monotonic()}
-            def review():
-                try: result=quality_ai.evaluate(d)
-                except Exception as e:
-                    print('Quality check unavailable:',type(e).__name__,flush=True)
-                    result={'status':'review','issues':['Local vision check unavailable; verify Ollama, model and GPU memory.']}
-                with LOCK:JOBS[job].update(state='done',result=result)
-            with LOCK:enqueue(review,(),job)
+                def review():
+                    try: result=quality_ai.evaluate(d)
+                    except Exception as e:
+                        print('Quality check unavailable:',type(e).__name__,flush=True)
+                        result={'status':'review','issues':['Local vision check unavailable; verify Ollama, model and GPU memory.']}
+                    with LOCK:JOBS[job].update(state='done',result=result)
+                launch(review,(),job,url,'qa')
             self.send_json(202,{'job':job});return
         if self.path=='/tennis-submit':
             try:
@@ -298,11 +399,12 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError,KeyError,TypeError,OverflowError):self.send_json(400,{'error':'BAD_BRACELET_PARAMS'});return
             with LOCK:
                 if STARTS>=session_limit():self.send_json(429,{'error':'SESSION_LIMIT'});return
-                if active_count()>=MAX_ACTIVE:self.send_json(409,{'error':'BUSY'});return
+                url=reserve('tennis')
+                if url is None:self.send_json(409,{'error':'BUSY'});return
                 job=uuid.uuid4().hex
                 JOBS[job]={'state':'running','start':time.monotonic()}
                 STARTS+=1
-                enqueue(work_tennis,(job,params),job)
+                launch(work_tennis,(job,params),job,url,'tennis')
             self.send_json(202,{'job':job});return
         if self.path=='/image-submit':
             try:
@@ -322,15 +424,18 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:self.send_json(400,{'error':'BAD_IMAGE_REQUEST'});return
             with LOCK:
                 if STARTS>=session_limit():self.send_json(429,{'error':'SESSION_LIMIT'});return
-                if active_count()>=MAX_ACTIVE:self.send_json(409,{'error':'BUSY'});return
-                try:
-                    check_comfy_queue()
-                except Exception:self.send_json(503,{'error':'COMFY_OFFLINE'});return
                 if not (ROOT/IMAGE_WORKFLOWS[mode]).exists():self.send_json(503,{'error':'IMAGE_WORKFLOW_MISSING'});return
+                if mode=='text' and BATCH_LIMIT>1:
+                    job=uuid.uuid4().hex
+                    if not batch_offer(job,prompt):self.send_json(409,{'error':'BUSY'});return
+                    STARTS+=1
+                    self.send_json(202,{'job':job,'phase':'collecting'});return
+                url=reserve('image')
+                if url is None:self.send_json(409,{'error':'BUSY'});return
                 job=uuid.uuid4().hex
                 JOBS[job]={'state':'running','kind':'image','start':time.monotonic()}
                 STARTS+=1
-                enqueue(work_image,(job,prompt,image,ext),job)
+                launch(work_image,(job,prompt,image,ext),job,url,'image')
             self.send_json(202,{'job':job});return
         if self.path!='/submit':self.send_json(404,{'error':'NOT_FOUND'});return
         try:
@@ -344,18 +449,21 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:self.send_json(400,{'error':'BAD_IMAGE'});return
         with LOCK:
             if STARTS>=session_limit():self.send_json(429,{'error':'SESSION_LIMIT'});return
-            if active_count()>=MAX_ACTIVE:self.send_json(409,{'error':'BUSY'});return
+            url=reserve('3d')
+            if url is None:self.send_json(409,{'error':'BUSY'});return
             try:
                 q=core.req(BASE,'/queue',timeout=3)
                 
             except Exception:self.send_json(503,{'error':'COMFY_OFFLINE'});return
             job=uuid.uuid4().hex;JOBS[job]={'state':'running','start':time.monotonic()};STARTS+=1
-            enqueue(work,(job,image,ext,engine,quality),job)
+            launch(work,(job,image,ext,engine,quality),job,url,'3d')
         self.send_json(202,{'job':job})
 
 if __name__=='__main__':
     BASE,s=core.find_server()
     if not any('4090' in str(d.get('name','')) for d in s.get('devices',[]) if isinstance(d,dict)):raise RuntimeError('RTX 4090 not detected')
-    print('CARATZON V4.1 PRIVATE BRIDGE\nComfyUI:',BASE,'\nBridge: http://127.0.0.1:8765\nPrivate token file:',TOKEN_FILE,'\n',session_limit(),'jobs per session; edit MAX_3D_JOBS.txt to change. Up to five outstanding jobs; one GPU worker. Keep this window open.\nDo NOT share the token or tunnel URL publicly.',flush=True)
-    threading.Thread(target=worker455,daemon=True).start()
+    BACKENDS=load_backends()
+    BATCH_LIMIT=load_batch_limit()
+    print('CARATZON V4.5.6 PRIVATE BRIDGE\nComfyUI:',BASE,'\nBridge: http://127.0.0.1:8765\nPrivate token file:',TOKEN_FILE,'\n',session_limit(),'jobs per session; edit MAX_3D_JOBS.txt to change. No waiting queue; image slots: '+str(len(BACKENDS))+'. Keep this window open.\nDo NOT share the token or tunnel URL publicly.',flush=True)
+    print('Batch text limit:',BATCH_LIMIT,'(brief collection only, no serial fallback)',flush=True)
     ThreadingHTTPServer(('127.0.0.1',8765),Handler).serve_forever()
