@@ -1,0 +1,8 @@
+{
+  "enabled": false,
+  "printer": "",
+  "prusa": "C:\\Program Files\\Prusa3D\\PrusaSlicer\\prusa-slicer-console.exe",
+  "uvtools": "C:\\UVtools\\UVtoolsCmd.exe",
+  "profile": "C:\\CARATZON\\printer.ini",
+  "version": 4
+}

@@ -7,6 +7,7 @@ import tennis_geometry
 import tennis_obj
 import quality_ai
 import batch456
+import ctb457
 ROOT=Path(__file__).resolve().parent
 TOKEN_FILE=ROOT/'PRIVATE_BRIDGE_TOKEN.txt'
 if not TOKEN_FILE.exists(): TOKEN_FILE.write_text(secrets.token_hex(32),encoding='ascii')
@@ -334,6 +335,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.allowed():return
         u=urlsplit(self.path)
+        if ctb457.get(self,u):return
         if self.transfer_get(u):return
         qa=re.fullmatch(r'/qa-job/([a-f0-9]{32})',u.path)
         if qa:
@@ -366,6 +368,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         global STARTS
         if not self.allowed():return
+        if ctb457.post(self):return
         if self.transfer_post():return
         if self.path=='/qa-submit':
             try:
@@ -464,6 +467,6 @@ if __name__=='__main__':
     if not any('4090' in str(d.get('name','')) for d in s.get('devices',[]) if isinstance(d,dict)):raise RuntimeError('RTX 4090 not detected')
     BACKENDS=load_backends()
     BATCH_LIMIT=load_batch_limit()
-    print('CARATZON V4.5.6 PRIVATE BRIDGE\nComfyUI:',BASE,'\nBridge: http://127.0.0.1:8765\nPrivate token file:',TOKEN_FILE,'\n',session_limit(),'jobs per session; edit MAX_3D_JOBS.txt to change. No waiting queue; image slots: '+str(len(BACKENDS))+'. Keep this window open.\nDo NOT share the token or tunnel URL publicly.',flush=True)
+    print('CARATZON V4.5.7 PRIVATE BRIDGE\nComfyUI:',BASE,'\nBridge: http://127.0.0.1:8765\nPrivate token file:',TOKEN_FILE,'\n',session_limit(),'jobs per session; edit MAX_3D_JOBS.txt to change. No waiting queue; image slots: '+str(len(BACKENDS))+'. Keep this window open.\nDo NOT share the token or tunnel URL publicly.',flush=True)
     print('Batch text limit:',BATCH_LIMIT,'(brief collection only, no serial fallback)',flush=True)
     ThreadingHTTPServer(('127.0.0.1',8765),Handler).serve_forever()

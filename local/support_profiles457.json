@@ -1,0 +1,76 @@
+{
+  "version": "4.5.7",
+  "profiles": {
+    "jewelry_fine_dense": {
+      "label": "Jewelry Fine Dense",
+      "tip_mm": 0.28,
+      "upper_mm": 0.7,
+      "mid_mm": 0.95,
+      "base_mm": 1.35,
+      "foot_mm": 2.4,
+      "angle_deg": 32,
+      "density": 0.78,
+      "max_upper_mm": 0.9,
+      "avoid_horizontal_rods": true,
+      "backface_priority": true,
+      "default_for": [
+        "earring",
+        "openwork_earring"
+      ]
+    },
+    "jewelry_medium": {
+      "label": "Jewelry Medium",
+      "tip_mm": 0.35,
+      "upper_mm": 0.85,
+      "mid_mm": 1.1,
+      "base_mm": 1.55,
+      "foot_mm": 2.8,
+      "angle_deg": 30,
+      "density": 0.62,
+      "max_upper_mm": 1.0,
+      "avoid_horizontal_rods": true,
+      "backface_priority": true,
+      "default_for": [
+        "pendant"
+      ]
+    },
+    "ring_prong_safe": {
+      "label": "Ring Prong Safe",
+      "tip_mm": 0.3,
+      "upper_mm": 0.7,
+      "mid_mm": 0.95,
+      "base_mm": 1.4,
+      "foot_mm": 2.6,
+      "angle_deg": 38,
+      "density": 0.66,
+      "max_upper_mm": 0.95,
+      "avoid_horizontal_rods": true,
+      "backface_priority": true,
+      "default_for": [
+        "ring"
+      ]
+    },
+    "brooch_back_safe": {
+      "label": "Brooch Back Safe",
+      "tip_mm": 0.32,
+      "upper_mm": 0.8,
+      "mid_mm": 1.0,
+      "base_mm": 1.45,
+      "foot_mm": 2.6,
+      "angle_deg": 28,
+      "density": 0.58,
+      "max_upper_mm": 0.95,
+      "avoid_horizontal_rods": true,
+      "backface_priority": true,
+      "default_for": [
+        "brooch"
+      ]
+    }
+  },
+  "output_modes": [
+    "preview",
+    "supports_only",
+    "combined",
+    "model_only"
+  ]
+}
